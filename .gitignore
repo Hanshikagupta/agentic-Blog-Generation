@@ -1,1 +1,10 @@
 .env
+chroma_db/
+__pycache__/
+*.pyc
+.venv/
+venv/
+images/
+*.md
+!README.md
+!knowledge_base/*.md

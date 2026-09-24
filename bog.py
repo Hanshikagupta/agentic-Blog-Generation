@@ -16,6 +16,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
+from rag.store import KnowledgeBase, RetrievedChunk
+
 load_dotenv()
 
 # ============================================================
@@ -85,14 +87,22 @@ class GlobalImagePlan(BaseModel):
     md_with_placeholders: str
     images: List[ImageSpec] = Field(default_factory=list)
 
+
+class QualityReport(BaseModel):
+    score: float = Field(..., ge=0, le=10, description="Overall quality score out of 10.")
+    notes: str = Field(..., description="Brief evaluation notes with improvement suggestions.")
+
+
 class State(TypedDict):
     topic: str
 
-    # routing / research
+    # routing / research / RAG
     mode: str
     needs_research: bool
     queries: List[str]
+    use_rag: bool
     evidence: List[EvidenceItem]
+    kb_evidence: List[EvidenceItem]
     plan: Optional[Plan]
 
     # recency
@@ -108,6 +118,7 @@ class State(TypedDict):
     image_specs: List[dict]
 
     final: str
+    quality_report: Optional[QualityReport]
 
 
 # -----------------------------
@@ -158,8 +169,42 @@ def router_node(state: State) -> dict:
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
 
+
 # -----------------------------
-# 4) Research (Tavily)
+# 4) RAG retrieval (knowledge base)
+# -----------------------------
+def _chunks_to_evidence(chunks: List[RetrievedChunk]) -> List[EvidenceItem]:
+    evidence: List[EvidenceItem] = []
+    for chunk in chunks:
+        evidence.append(
+            EvidenceItem(
+                title=chunk.title,
+                url=f"kb://{chunk.source}",
+                snippet=chunk.content[:600],
+                source=f"knowledge_base (score={chunk.score:.2f})",
+            )
+        )
+    return evidence
+
+
+def rag_retrieve_node(state: State) -> dict:
+    if not state.get("use_rag", True):
+        return {"kb_evidence": []}
+
+    kb = KnowledgeBase()
+    if not kb.exists:
+        return {"kb_evidence": []}
+
+    query = state["topic"]
+    if state.get("queries"):
+        query = f"{state['topic']} {' '.join(state['queries'][:3])}"
+
+    chunks = kb.retrieve(query, k=8)
+    return {"kb_evidence": _chunks_to_evidence(chunks)}
+
+
+# -----------------------------
+# 5) Research (Tavily)
 # -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
     if not os.getenv("TAVILY_API_KEY"):
@@ -240,7 +285,7 @@ def research_node(state: State) -> dict:
     return {"evidence": evidence}
 
 # -----------------------------
-# 5) Orchestrator (Plan)
+# 6) Orchestrator (Plan)
 # -----------------------------
 ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
@@ -257,13 +302,23 @@ Grounding:
   - No tutorial content unless requested
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
+Knowledge base (kb:// URLs): internal domain docs — prefer for evergreen concepts and best practices.
+Web evidence: external URLs — prefer for recent events and citations.
+
 Output must match Plan schema.
 """
+
+
+def _combined_evidence(state: State) -> List[EvidenceItem]:
+    kb = state.get("kb_evidence", [])
+    web = state.get("evidence", [])
+    return kb + web
+
 
 def orchestrator_node(state: State) -> dict:
     planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
-    evidence = state.get("evidence", [])
+    evidence = _combined_evidence(state)
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
@@ -276,7 +331,10 @@ def orchestrator_node(state: State) -> dict:
                     f"Mode: {mode}\n"
                     f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
                     f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                    f"Knowledge base evidence ({len(state.get('kb_evidence', []))} items):\n"
+                    f"{[e.model_dump() for e in state.get('kb_evidence', [])][:8]}\n\n"
+                    f"Web evidence ({len(state.get('evidence', []))} items):\n"
+                    f"{[e.model_dump() for e in state.get('evidence', [])][:8]}"
                 )
             ),
         ]
@@ -288,10 +346,11 @@ def orchestrator_node(state: State) -> dict:
 
 
 # -----------------------------
-# 6) Fanout
+# 7) Fanout
 # -----------------------------
 def fanout(state: State):
     assert state["plan"] is not None
+    combined = _combined_evidence(state)
     return [
         Send(
             "worker",
@@ -302,14 +361,14 @@ def fanout(state: State):
                 "as_of": state["as_of"],
                 "recency_days": state["recency_days"],
                 "plan": state["plan"].model_dump(),
-                "evidence": [e.model_dump() for e in state.get("evidence", [])],
+                "evidence": [e.model_dump() for e in combined],
             },
         )
         for task in state["plan"].tasks
     ]
 
 # -----------------------------
-# 7) Worker
+# 8) Worker
 # -----------------------------
 WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
 Write ONE section of a technical blog post in Markdown.
@@ -324,6 +383,7 @@ Scope guard:
   Focus on events + implications.
 
 Grounding:
+- kb:// URLs are internal knowledge-base sources — use for domain concepts and best practices.
 - If mode=="open_book": do not introduce any specific event/company/model/funding/policy claim unless supported by provided Evidence URLs.
   For each supported claim, attach a Markdown link ([Source](URL)).
   If unsupported, write "Not found in provided sources."
@@ -374,7 +434,7 @@ def worker_node(payload: dict) -> dict:
     return {"sections": [(task.id, section_md)]}
 
 # ============================================================
-# 8) ReducerWithImages (subgraph)
+# 9) ReducerWithImages (subgraph)
 #    merge_content -> decide_images -> generate_and_place_images
 # ============================================================
 def merge_content(state: State) -> dict:
@@ -536,58 +596,53 @@ reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
 
 # -----------------------------
-# 9) Build main graph
+# 10) Quality evaluation
 # -----------------------------
-g = StateGraph(State)
-g.add_node("router", router_node)
-g.add_node("research", research_node)
-g.add_node("orchestrator", orchestrator_node)
-g.add_node("worker", worker_node)
-g.add_node("reducer", reducer_subgraph)
+EVAL_SYSTEM = """You are a technical blog editor. Evaluate the generated blog post.
 
-g.add_edge(START, "router")
-g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
-g.add_edge("research", "orchestrator")
+Score 0–10 based on:
+- Clarity and structure
+- Technical accuracy (given available evidence)
+- Actionability for the target audience
+- Appropriate depth and scope
 
-g.add_conditional_edges("orchestrator", fanout, ["worker"])
-g.add_edge("worker", "reducer")
-g.add_edge("reducer", END)
-
-app = g.compile()
+Provide concise notes with 1–2 specific improvement suggestions.
+"""
 
 
-# ============================================================
-# 10) Main execution with terminal input
-# ============================================================
-if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("Blog Writing Agent")
-    print("="*60 + "\n")
+def evaluate_node(state: State) -> dict:
+    content = state.get("final") or state.get("merged_md", "")
+    if not content.strip():
+        return {"quality_report": QualityReport(score=0.0, notes="No content generated.")}
 
-    # Get topic from terminal input
-    topic = input("Enter blog topic: ").strip()
-    if not topic:
-        print("Error: Topic cannot be empty.")
-        exit(1)
+    evaluator = llm.with_structured_output(QualityReport)
+    report = evaluator.invoke(
+        [
+            SystemMessage(content=EVAL_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {state.get('mode')}\n"
+                    f"KB chunks used: {len(state.get('kb_evidence', []))}\n"
+                    f"Web evidence: {len(state.get('evidence', []))}\n\n"
+                    f"Blog:\n{content[:8000]}"
+                )
+            ),
+        ]
+    )
+    return {"quality_report": report}
 
-    # Optional: Get as_of date (defaults to today)
-    as_of_input = input("Enter as-of date (YYYY-MM-DD) [default: today]: ").strip()
-    if as_of_input:
-        try:
-            as_of = as_of_input
-        except Exception:
-            print(f"Invalid date format. Using today's date.")
-            as_of = date.today().isoformat()
-    else:
-        as_of = date.today().isoformat()
 
-    # Prepare inputs for the graph
-    inputs = {
+def build_initial_state(topic: str, as_of: str, use_rag: bool = True) -> dict:
+    """Build graph input state (used by CLI and API)."""
+    return {
         "topic": topic,
         "mode": "",
         "needs_research": False,
         "queries": [],
+        "use_rag": use_rag,
         "evidence": [],
+        "kb_evidence": [],
         "plan": None,
         "as_of": as_of,
         "recency_days": 7,
@@ -596,41 +651,99 @@ if __name__ == "__main__":
         "md_with_placeholders": "",
         "image_specs": [],
         "final": "",
+        "quality_report": None,
     }
+
+
+# -----------------------------
+# 11) Build main graph
+# -----------------------------
+g = StateGraph(State)
+g.add_node("router", router_node)
+g.add_node("rag_retrieve", rag_retrieve_node)
+g.add_node("research", research_node)
+g.add_node("orchestrator", orchestrator_node)
+g.add_node("worker", worker_node)
+g.add_node("reducer", reducer_subgraph)
+g.add_node("evaluate", evaluate_node)
+
+g.add_edge(START, "router")
+g.add_edge("router", "rag_retrieve")
+g.add_conditional_edges("rag_retrieve", route_next, {"research": "research", "orchestrator": "orchestrator"})
+g.add_edge("research", "orchestrator")
+
+g.add_conditional_edges("orchestrator", fanout, ["worker"])
+g.add_edge("worker", "reducer")
+g.add_edge("reducer", "evaluate")
+g.add_edge("evaluate", END)
+
+app = g.compile()
+
+
+# ============================================================
+# 12) Main execution with terminal input
+# ============================================================
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("Blog Writing Agent (RAG + Research + Images)")
+    print("=" * 60 + "\n")
+
+    topic = input("Enter blog topic: ").strip()
+    if not topic:
+        print("Error: Topic cannot be empty.")
+        exit(1)
+
+    as_of_input = input("Enter as-of date (YYYY-MM-DD) [default: today]: ").strip()
+    as_of = as_of_input if as_of_input else date.today().isoformat()
+
+    rag_input = input("Use knowledge base (RAG)? [Y/n]: ").strip().lower()
+    use_rag = rag_input not in ("n", "no")
+
+    kb = KnowledgeBase()
+    if use_rag and kb.exists:
+        print(f"Knowledge base: {kb.count()} chunks available")
+    elif use_rag:
+        print("Knowledge base: empty (run `python index_docs.py` to index documents)")
+
+    inputs = build_initial_state(topic=topic, as_of=as_of, use_rag=use_rag)
 
     print(f"\nProcessing: {topic}")
     print(f"As-of date: {as_of}\n")
 
-    # Run the graph
     try:
         result = app.invoke(inputs)
-        print("\n" + "="*60)
-        print("✅ Blog generation completed successfully!")
-        print("="*60 + "\n")
+        print("\n" + "=" * 60)
+        print("Blog generation completed successfully!")
+        print("=" * 60 + "\n")
 
-        # Display final result
         if result.get("final"):
             print("Generated Blog:\n")
             print(result["final"])
 
-            # Save to file
             filename = f"{title := (result.get('plan').blog_title if result.get('plan') else 'blog')}.md"
             filename = filename.replace(" ", "_").lower()
             Path(filename).write_text(result["final"], encoding="utf-8")
-            print(f"\n✅ Blog saved to: {filename}")
+            print(f"\nBlog saved to: {filename}")
 
-        # Display plan summary
         if result.get("plan"):
             plan = result["plan"]
-            print(f"\n📋 Plan Summary:")
+            print(f"\nPlan Summary:")
             print(f"   Title: {plan.blog_title}")
             print(f"   Audience: {plan.audience}")
             print(f"   Tone: {plan.tone}")
             print(f"   Kind: {plan.blog_kind}")
             print(f"   Tasks: {len(plan.tasks)}")
 
+        print(f"\nRAG chunks used: {len(result.get('kb_evidence', []))}")
+        print(f"Web evidence items: {len(result.get('evidence', []))}")
+
+        if result.get("quality_report"):
+            qr = result["quality_report"]
+            print(f"\nQuality score: {qr.score}/10")
+            print(f"Notes: {qr.notes}")
+
     except Exception as e:
-        print(f"❌ Error during blog generation: {e}")
+        print(f"Error during blog generation: {e}")
         import traceback
         traceback.print_exc()
         exit(1)
